@@ -14,7 +14,7 @@ class JITMemoryTracker final
 public:
   JITMemoryTracker();
 
-  void RegisterJITRegion(void* ptr, size_t size);
+  void RegisterJITRegion(void* rx_ptr, void* rw_ptr, size_t size);
   void UnregisterJITRegion(void* ptr);
 
   void JITRegionWriteEnableExecuteDisable(void* ptr);
@@ -23,7 +23,8 @@ public:
 private:
   struct JITRegionInfo
   {
-    void* start_ptr;
+    void* rx_ptr;
+    void* rw_ptr;
     size_t size;
     int nest_counter;
   };

@@ -31,6 +31,7 @@
 
 #ifdef IPHONEOS
 #include "Common/JITMemoryTracker.h"
+#include <mach/mach.h>
 #endif
 
 namespace Common
@@ -58,16 +59,51 @@ void* AllocateExecutableMemory(size_t size)
   map_prot |= PROT_WRITE;
 #endif
 
+#ifndef IPHONEOS
   void* ptr = mmap(nullptr, size, map_prot, map_flags, -1, 0);
   if (ptr == MAP_FAILED)
     ptr = nullptr;
+#else
+  void* rw_ptr = mmap(nullptr, size, map_prot, map_flags, -1, 0);
+  if (rw_ptr == MAP_FAILED)
+    rw_ptr = nullptr;
+
+  vm_address_t rx_addr = 0;
+  vm_prot_t curProt = 0;
+  vm_prot_t maxProt = 0;
+  if (rw_ptr)
+  {
+    kern_return_t remap_result = vm_remap(mach_task_self_, &rx_addr, size, 0, VM_FLAGS_ANYWHERE,
+                                          mach_task_self_, reinterpret_cast<vm_address_t>(rw_ptr), 0,
+                                          &curProt, &maxProt, VM_INHERIT_NONE);
+    if (remap_result != KERN_SUCCESS)
+    {
+      munmap(rw_ptr, size);
+      rw_ptr = nullptr;
+    }
+  }
+
+  if (rw_ptr)
+  {
+    if (vm_protect(mach_task_self_, rx_addr, size, 0, VM_PROT_READ | VM_PROT_EXECUTE) != KERN_SUCCESS ||
+        vm_protect(mach_task_self_, reinterpret_cast<vm_address_t>(rw_ptr), size, 0,
+                    VM_PROT_READ | VM_PROT_WRITE) != KERN_SUCCESS)
+    {
+      vm_deallocate(mach_task_self_, rx_addr, size);
+      munmap(rw_ptr, size);
+      rw_ptr = nullptr;
+    }
+  }
+
+  void* ptr = rw_ptr ? reinterpret_cast<void*>(rx_addr) : nullptr;
+#endif
 #endif
 
   if (ptr == nullptr)
     PanicAlertFmt("Failed to allocate executable memory: {}", LastStrerrorString());
 
 #ifdef IPHONEOS
-  g_jit_memory_tracker.RegisterJITRegion(ptr, size);
+  g_jit_memory_tracker.RegisterJITRegion(ptr, rw_ptr, size);
 #endif
 
   return ptr;
@@ -202,10 +238,23 @@ bool FreeMemoryPages(void* ptr, size_t size)
       return false;
     }
 #else
-    if (munmap(ptr, size) != 0)
+    JITMemoryTracker::JITRegionInfo* info = g_jit_memory_tracker.FindRegion(ptr);
+    if (info)
     {
-      PanicAlertFmt("FreeMemoryPages failed!\nmunmap: {}", LastStrerrorString());
-      return false;
+      vm_deallocate(mach_task_self_, reinterpret_cast<vm_address_t>(info->rx_ptr), size);
+      if (munmap(info->rw_ptr, size) != 0)
+      {
+        PanicAlertFmt("FreeMemoryPages failed!\nmunmap: {}", LastStrerrorString());
+        return false;
+      }
+    }
+    else
+    {
+      if (munmap(ptr, size) != 0)
+      {
+        PanicAlertFmt("FreeMemoryPages failed!\nmunmap: {}", LastStrerrorString());
+        return false;
+      }
     }
 #endif
 
@@ -256,6 +305,26 @@ bool WriteProtectMemory(void* ptr, size_t size, bool allowExecute)
     PanicAlertFmt("WriteProtectMemory failed!\nVirtualProtect: {}", GetLastErrorString());
     return false;
   }
+#elif defined(IPHONEOS)
+  JITMemoryTracker::JITRegionInfo* info = g_jit_memory_tracker.FindRegion(ptr);
+  if (info)
+  {
+    kern_return_t ret = vm_protect(mach_task_self_, reinterpret_cast<vm_address_t>(info->rw_ptr), size, 0,
+                                   VM_PROT_READ);
+    if (ret != KERN_SUCCESS)
+    {
+      PanicAlertFmt("WriteProtectMemory failed! vm_protect: {:#x}", ret);
+      return false;
+    }
+  }
+  else
+  {
+    if (mprotect(ptr, size, PROT_READ) != 0)
+    {
+      PanicAlertFmt("WriteProtectMemory failed!\nmprotect: {}", LastStrerrorString());
+      return false;
+    }
+  }
 #elif !(defined(_M_ARM_64) && defined(__APPLE__) && !defined(IPHONEOS))
   // MacOS 11.2 on ARM does not allow for changing the access permissions of pages
   // that were marked executable, instead it uses the protections offered by MAP_JIT
@@ -277,6 +346,26 @@ bool UnWriteProtectMemory(void* ptr, size_t size, bool allowExecute)
   {
     PanicAlertFmt("UnWriteProtectMemory failed!\nVirtualProtect: {}", GetLastErrorString());
     return false;
+  }
+#elif defined(IPHONEOS)
+  JITMemoryTracker::JITRegionInfo* info = g_jit_memory_tracker.FindRegion(ptr);
+  if (info)
+  {
+    kern_return_t ret = vm_protect(mach_task_self_, reinterpret_cast<vm_address_t>(info->rw_ptr), size, 0,
+                                   VM_PROT_READ | VM_PROT_WRITE);
+    if (ret != KERN_SUCCESS)
+    {
+      PanicAlertFmt("UnWriteProtectMemory failed! vm_protect: {:#x}", ret);
+      return false;
+    }
+  }
+  else
+  {
+    if (mprotect(ptr, size, PROT_READ | PROT_WRITE) != 0)
+    {
+      PanicAlertFmt("UnWriteProtectMemory failed!\nmprotect: {}", LastStrerrorString());
+      return false;
+    }
   }
 #elif !(defined(_M_ARM_64) && defined(__APPLE__) && !defined(IPHONEOS))
   // MacOS 11.2 on ARM does not allow for changing the access permissions of pages

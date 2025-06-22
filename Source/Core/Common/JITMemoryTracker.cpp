@@ -11,24 +11,38 @@ namespace Common
 {
 JITMemoryTracker::JITMemoryTracker() = default;
 
-void JITMemoryTracker::RegisterJITRegion(void* ptr, size_t size)
+void JITMemoryTracker::RegisterJITRegion(void* rx_ptr, void* rw_ptr, size_t size)
 {
   std::scoped_lock lk(m_mutex);
 
-  if (m_jit_regions.find(ptr) != m_jit_regions.end())
+  if (m_jit_regions.find(rx_ptr) != m_jit_regions.end())
   {
-    PanicAlertFmt("JITMemoryTracker: region {} already registered", ptr);
+    PanicAlertFmt("JITMemoryTracker: region {} already registered", rx_ptr);
     return;
   }
 
-  m_jit_regions[ptr] = {ptr, size, 0};
+  m_jit_regions[rx_ptr] = {rx_ptr, rw_ptr, size, 0};
 }
 
 void JITMemoryTracker::UnregisterJITRegion(void* ptr)
 {
   std::scoped_lock lk(m_mutex);
 
-  m_jit_regions.erase(ptr);
+  auto it = m_jit_regions.find(ptr);
+  if (it != m_jit_regions.end())
+  {
+    m_jit_regions.erase(it);
+    return;
+  }
+
+  for (auto iter = m_jit_regions.begin(); iter != m_jit_regions.end(); ++iter)
+  {
+    if (iter->second.rw_ptr == ptr)
+    {
+      m_jit_regions.erase(iter);
+      return;
+    }
+  }
 }
 
 JITMemoryTracker::JITRegionInfo* JITMemoryTracker::FindRegion(void* ptr)
@@ -40,8 +54,14 @@ JITMemoryTracker::JITRegionInfo* JITMemoryTracker::FindRegion(void* ptr)
 
   for (auto& info : m_jit_regions)
   {
-    void* region_end = static_cast<void*>(static_cast<u8*>(info.first) + info.second.size);
-    if (ptr >= info.first && ptr <= region_end)
+    void* rx_end = static_cast<void*>(static_cast<u8*>(info.second.rx_ptr) + info.second.size);
+    if (ptr >= info.second.rx_ptr && ptr <= rx_end)
+    {
+      return &info.second;
+    }
+
+    void* rw_end = static_cast<void*>(static_cast<u8*>(info.second.rw_ptr) + info.second.size);
+    if (ptr >= info.second.rw_ptr && ptr <= rw_end)
     {
       return &info.second;
     }
@@ -63,7 +83,7 @@ void JITMemoryTracker::JITRegionWriteEnableExecuteDisable(void* ptr)
 
   if (info->nest_counter == 0)
   {
-    UnWriteProtectMemory(info->start_ptr, info->size, false);
+    UnWriteProtectMemory(info->rw_ptr, info->size, false);
   }
 
   info->nest_counter++;
@@ -88,7 +108,7 @@ void JITMemoryTracker::JITRegionWriteDisableExecuteEnable(void* ptr)
   }
   else if (info->nest_counter == 0)
   {
-    WriteProtectMemory(info->start_ptr, info->size, true);
+    WriteProtectMemory(info->rw_ptr, info->size, true);
   }
 }
 }  // namespace Common
